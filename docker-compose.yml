@@ -1,0 +1,18 @@
+services:
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    image: rl-reading-group-reinforce:latest
+    container_name: rl-reading-group-reinforce
+    environment:
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN:-reinforce}
+      MPLCONFIGDIR: /workspace/.matplotlib
+    ports:
+      - "127.0.0.1:8888:8888"
+    volumes:
+      - .:/workspace
+    working_dir: /workspace

@@ -1,0 +1,13 @@
+.git
+.DS_Store
+.ipynb_checkpoints
+.matplotlib
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
