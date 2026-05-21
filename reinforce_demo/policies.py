@@ -52,6 +52,47 @@ def set_seed(seed: int = 0) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def select_device(use_gpu: bool | str = False) -> torch.device:
+    """Choose the PyTorch device used by the policy network.
+
+    `use_gpu=False` always returns CPU. `use_gpu=True` tries CUDA first, then
+    Apple Silicon MPS, and falls back to CPU if no GPU backend is available.
+    String values such as `"cuda"`, `"mps"`, `"cpu"`, and `"auto"` are accepted
+    so notebooks can expose a simple tweakable setting.
+    """
+
+    if isinstance(use_gpu, str):
+        requested = use_gpu.strip().lower()
+        if requested in {"false", "0", "no", "cpu"}:
+            return torch.device("cpu")
+        if requested == "cuda":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if requested == "mps":
+            has_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+            return torch.device("mps" if has_mps else "cpu")
+        if requested not in {"true", "1", "yes", "gpu", "auto"}:
+            raise ValueError("use_gpu must be a bool or one of: cpu, cuda, mps, auto")
+    elif not use_gpu:
+        return torch.device("cpu")
+
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def policy_device(policy: nn.Module) -> torch.device:
+    """Return the device where a policy's parameters live."""
+
+    try:
+        return next(policy.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
 
 
 class TabularSoftmaxPolicy(nn.Module):
@@ -219,9 +260,10 @@ def collect_episode(
     state = env.reset()
     states, actions, rewards = [], [], []
     log_probs, entropies, next_states, infos = [], [], [], []
+    device = policy_device(policy)
 
     for _ in range(env.max_steps):
-        state_index = torch.tensor([env.state_to_index(state)], dtype=torch.long)
+        state_index = torch.tensor([env.state_to_index(state)], dtype=torch.long, device=device)
         with torch.set_grad_enabled(track_grad):
             dist = policy.dist(state_index)
             if greedy:
@@ -257,7 +299,11 @@ def collect_episode(
     }
 
 
-def discounted_returns(rewards: Sequence[float], gamma: float) -> torch.Tensor:
+def discounted_returns(
+    rewards: Sequence[float],
+    gamma: float,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
     """Compute future reward totals `G_t` for every step in an episode.
 
     `gamma` discounts later rewards. A value near 1 means future rewards still
@@ -270,7 +316,7 @@ def discounted_returns(rewards: Sequence[float], gamma: float) -> torch.Tensor:
         running_return = float(reward) + gamma * running_return
         returns.append(running_return)
     returns.reverse()
-    return torch.tensor(returns, dtype=torch.float32)
+    return torch.tensor(returns, dtype=torch.float32, device=device)
 
 
 def returns_and_advantages(
@@ -278,6 +324,7 @@ def returns_and_advantages(
     gamma: float,
     normalize_returns: bool = True,
     update_mode: str = DEFAULT_UPDATE_MODE,
+    device: torch.device | str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute returns and the learning signal used by the policy update.
 
@@ -287,11 +334,17 @@ def returns_and_advantages(
     """
 
     update_mode = resolve_update_mode(update_mode)
-    returns = discounted_returns(rewards, gamma)
+    returns = discounted_returns(rewards, gamma, device=device)
     advantages = returns.clone()
     if update_mode == "advantage" and normalize_returns and len(advantages) > 1:
         advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
     return returns, advantages
+
+
+def _to_float(value: float | torch.Tensor) -> float:
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().cpu().item())
+    return float(value)
 
 
 def _gradient_norm(parameters) -> torch.Tensor:
@@ -301,6 +354,86 @@ def _gradient_norm(parameters) -> torch.Tensor:
     if not norms:
         return torch.tensor(0.0)
     return torch.norm(torch.stack(norms), p=2)
+
+
+def reinforce_update_batch(
+    policy: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    episodes: Sequence[Episode],
+    gamma: float = 0.98,
+    normalize_returns: bool = True,
+    entropy_coef: float = 0.01,
+    max_grad_norm: float | None = 1.0,
+    update_mode: str = DEFAULT_UPDATE_MODE,
+) -> dict[str, float]:
+    """Apply one REINFORCE update from a batch of sampled episodes.
+
+    `vanilla` mode uses raw discounted returns in the policy-gradient loss.
+    `advantage` mode keeps the existing normalized return-as-advantage signal
+    and optional entropy bonus. The batch loss averages the per-episode policy
+    gradients, matching the usual sampled-trajectory estimate of REINFORCE.
+    """
+
+    episodes = list(episodes)
+    if len(episodes) == 0:
+        raise ValueError("episodes must contain at least one sampled episode")
+
+    update_mode = resolve_update_mode(update_mode)
+    if update_mode == "vanilla":
+        normalize_returns = False
+        entropy_coef = 0.0
+        max_grad_norm = None
+
+    prepared = []
+    all_advantages = []
+    for episode in episodes:
+        log_probs = torch.stack(episode["log_probs"])
+        entropies = torch.stack(episode["entropies"])
+        returns = discounted_returns(episode["rewards"], gamma, device=log_probs.device)
+        advantages = returns.clone()
+        prepared.append((episode, log_probs, entropies, advantages))
+        all_advantages.append(advantages)
+
+    if update_mode == "advantage" and normalize_returns:
+        joined_advantages = torch.cat(all_advantages)
+        if len(joined_advantages) > 1:
+            mean = joined_advantages.mean()
+            std = joined_advantages.std(unbiased=False) + 1e-8
+            prepared = [
+                (episode, log_probs, entropies, (advantages - mean) / std)
+                for episode, log_probs, entropies, advantages in prepared
+            ]
+
+    policy_losses = []
+    entropy_bonuses = []
+    all_entropies = []
+    for _, log_probs, entropies, advantages in prepared:
+        policy_losses.append(-(log_probs * advantages.detach()).sum())
+        entropy_bonuses.append(entropies.sum())
+        all_entropies.append(entropies.detach())
+
+    policy_loss = torch.stack(policy_losses).mean()
+    entropy_bonus = torch.stack(entropy_bonuses).mean()
+    loss = policy_loss - entropy_coef * entropy_bonus
+
+    optimizer.zero_grad()
+    loss.backward()
+    if max_grad_norm is None:
+        grad_norm = _gradient_norm(policy.parameters())
+    else:
+        grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+    optimizer.step()
+
+    return {
+        "loss": _to_float(loss),
+        "policy_loss": _to_float(policy_loss),
+        "entropy": _to_float(torch.cat(all_entropies).mean()),
+        "grad_norm": _to_float(grad_norm),
+        "episode_return": float(np.mean([sum(episode["rewards"]) for episode in episodes])),
+        "mean_episode_return": float(np.mean([sum(episode["rewards"]) for episode in episodes])),
+        "mean_length": float(np.mean([len(episode["rewards"]) for episode in episodes])),
+        "batch_size": float(len(episodes)),
+    }
 
 
 def reinforce_update(
@@ -313,44 +446,15 @@ def reinforce_update(
     max_grad_norm: float | None = 1.0,
     update_mode: str = DEFAULT_UPDATE_MODE,
 ) -> dict[str, float]:
-    """Apply one REINFORCE update to the policy.
+    """Apply one REINFORCE update from a single sampled episode."""
 
-    `vanilla` mode uses raw discounted returns in the policy-gradient loss.
-    `advantage` mode keeps the existing normalized return-as-advantage signal
-    and optional entropy bonus.
-    """
-
-    update_mode = resolve_update_mode(update_mode)
-    if update_mode == "vanilla":
-        normalize_returns = False
-        entropy_coef = 0.0
-        max_grad_norm = None
-
-    returns, advantages = returns_and_advantages(
-        episode["rewards"],
-        gamma,
+    return reinforce_update_batch(
+        policy,
+        optimizer,
+        [episode],
+        gamma=gamma,
         normalize_returns=normalize_returns,
+        entropy_coef=entropy_coef,
+        max_grad_norm=max_grad_norm,
         update_mode=update_mode,
     )
-    log_probs = torch.stack(episode["log_probs"])
-    entropies = torch.stack(episode["entropies"])
-
-    policy_loss = -(log_probs * advantages.detach()).sum()
-    entropy_bonus = entropies.sum()
-    loss = policy_loss - entropy_coef * entropy_bonus
-
-    optimizer.zero_grad()
-    loss.backward()
-    if max_grad_norm is None:
-        grad_norm = _gradient_norm(policy.parameters())
-    else:
-        grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
-    optimizer.step()
-
-    return {
-        "loss": float(loss.item()),
-        "policy_loss": float(policy_loss.item()),
-        "entropy": float(entropies.mean().item()),
-        "grad_norm": float(grad_norm),
-        "episode_return": float(sum(episode["rewards"])),
-    }

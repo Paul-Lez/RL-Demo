@@ -15,7 +15,13 @@ from torch import nn
 
 from .environment import GridWorld
 from .plotting import moving_average, plot_policy, policy_action_probs
-from .policies import DEFAULT_UPDATE_MODE, Episode, collect_episode, reinforce_update, set_seed
+from .policies import (
+    DEFAULT_UPDATE_MODE,
+    Episode,
+    collect_episode,
+    reinforce_update_batch,
+    set_seed,
+)
 
 
 def train_reinforce(
@@ -33,17 +39,21 @@ def train_reinforce(
     dashboard_path: str | None = None,
     dashboard_every: int = 10,
     update_mode: str = DEFAULT_UPDATE_MODE,
+    batch_size: int = 1,
 ) -> tuple[dict[str, list[float]], dict[int, np.ndarray]]:
     """Train a policy with REINFORCE and return metrics plus snapshots.
 
     `stats` stores one value per episode for plotting. `snapshots` stores full
     policy probabilities at selected episodes so the notebook can show how the
-    arrows changed over time. `update_mode` selects raw vanilla REINFORCE or
-    the stabilized advantage-style update.
+    arrows changed over time. `batch_size` controls how many sampled episodes
+    are averaged into each policy-gradient update. `update_mode` selects raw
+    vanilla REINFORCE or the stabilized advantage-style update.
     """
 
     set_seed(seed)
     dashboard_every = max(1, int(dashboard_every))
+    snapshot_every = max(1, int(snapshot_every))
+    batch_size = max(1, int(batch_size))
     stats = {
         "returns": [],
         "lengths": [],
@@ -59,34 +69,51 @@ def train_reinforce(
 
         write_dashboard_snapshot(dashboard_path, env, policy, stats, 0, status="starting")
 
-    for episode_number in range(1, episodes + 1):
-        # 1. Try the task once using the current policy.
-        episode = collect_episode(env, policy, greedy=False, track_grad=True)
-        last_episode = episode
+    episode_number = 0
+    next_snapshot = snapshot_every
+    while episode_number < episodes:
+        current_batch_size = min(batch_size, episodes - episode_number)
 
-        # 2. Use that sampled episode to nudge the policy.
-        metrics = reinforce_update(
+        # 1. Try the task several times using the current policy.
+        batch = [
+            collect_episode(env, policy, greedy=False, track_grad=True)
+            for _ in range(current_batch_size)
+        ]
+        last_episode = batch[-1]
+
+        # 2. Average those sampled episodes into one policy-gradient update.
+        metrics = reinforce_update_batch(
             policy,
             optimizer,
-            episode,
+            batch,
             gamma=gamma,
             normalize_returns=normalize_returns,
             entropy_coef=entropy_coef,
             update_mode=update_mode,
         )
 
-        # 3. Record metrics so we can inspect learning afterward.
-        reached_goal = bool(episode["infos"][-1].reached_goal)
-        stats["returns"].append(metrics["episode_return"])
-        stats["lengths"].append(len(episode["rewards"]))
-        stats["success"].append(float(reached_goal))
-        stats["losses"].append(metrics["loss"])
-        stats["grad_norms"].append(metrics["grad_norm"])
+        # 3. Record per-episode outcomes so we can inspect learning afterward.
+        for episode in batch:
+            episode_number += 1
+            reached_goal = bool(episode["infos"][-1].reached_goal)
+            stats["returns"].append(float(sum(episode["rewards"])))
+            stats["lengths"].append(len(episode["rewards"]))
+            stats["success"].append(float(reached_goal))
+            stats["losses"].append(metrics["loss"])
+            stats["grad_norms"].append(metrics["grad_norm"])
 
-        if episode_number % snapshot_every == 0 or episode_number == episodes:
+        while episode_number >= next_snapshot:
+            snapshots[next_snapshot] = policy_action_probs(policy, env)
+            next_snapshot += snapshot_every
+        if episode_number == episodes:
             snapshots[episode_number] = policy_action_probs(policy, env)
 
-        if dashboard_path is not None and (episode_number == 1 or episode_number % dashboard_every == 0):
+        should_write_dashboard = (
+            episode_number == current_batch_size
+            or episode_number % dashboard_every == 0
+            or episode_number == episodes
+        )
+        if dashboard_path is not None and should_write_dashboard:
             from .dashboard import write_dashboard_snapshot
 
             write_dashboard_snapshot(
@@ -99,7 +126,7 @@ def train_reinforce(
                 status="training",
             )
 
-        if live and (episode_number == 1 or episode_number % refresh_every == 0):
+        if live and (episode_number == current_batch_size or episode_number % refresh_every == 0):
             clear_output(wait=True)
             fig, axes = plt.subplots(1, 2, figsize=(11, 5), constrained_layout=True)
             xs = np.arange(1, len(stats["returns"]) + 1)
