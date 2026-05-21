@@ -23,6 +23,7 @@ from .policies import (
     DEFAULT_UPDATE_MODE,
     Episode,
     discounted_returns,
+    policy_device,
     resolve_update_mode,
     returns_and_advantages,
 )
@@ -103,9 +104,10 @@ def policy_action_probs(policy: nn.Module, env: GridWorld) -> np.ndarray:
     """Return action probabilities for every non-obstacle grid cell."""
 
     probs = np.full((env.n, env.n, env.num_actions), np.nan, dtype=float)
+    device = policy_device(policy)
     with torch.no_grad():
         for state in env.free_states(include_goal=False):
-            index = torch.tensor([env.state_to_index(state)], dtype=torch.long)
+            index = torch.tensor([env.state_to_index(state)], dtype=torch.long, device=device)
             state_probs = policy.dist(index).probs.squeeze(0).cpu().numpy()
             probs[state[0], state[1]] = state_probs
     return probs
