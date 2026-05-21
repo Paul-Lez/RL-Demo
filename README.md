@@ -56,5 +56,6 @@ Then open `http://127.0.0.1:8888/lab?token=reinforce`.
 ## Things To Try
 
 In the notebook, change `REWARD_MODE` (`dense`, `sparse`, `sparse_length`,
-`dense_noop_penalty`) or `POLICY_MODE` (`tabular`, `mlp`, `large_mlp`) and
-compare the learning curves, learned policy arrows, and rollout animations.
+`dense_noop_penalty`), `POLICY_MODE` (`tabular`, `mlp`, `large_mlp`), or
+`UPDATE_MODE` (`vanilla`, `advantage`) and compare the learning curves, learned
+policy arrows, and rollout animations.

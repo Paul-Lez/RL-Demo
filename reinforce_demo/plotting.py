@@ -19,7 +19,13 @@ from matplotlib.animation import FuncAnimation
 from torch import nn
 
 from .environment import ACTION_NAMES, GridWorld, State
-from .policies import Episode, discounted_returns, returns_and_advantages
+from .policies import (
+    DEFAULT_UPDATE_MODE,
+    Episode,
+    discounted_returns,
+    resolve_update_mode,
+    returns_and_advantages,
+)
 
 GRID_CMAP = colors.ListedColormap(["#f8fafc", "#111827", "#bae6fd", "#bbf7d0"])
 GRID_NORM = colors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], GRID_CMAP.N)
@@ -222,11 +228,22 @@ def summarize_episode_update(
     gamma: float = 0.98,
     normalize_returns: bool = True,
     max_rows: int = 18,
+    update_mode: str = DEFAULT_UPDATE_MODE,
 ) -> None:
-    """Print the quantities used in one REINFORCE update."""
+    """Print the quantities used by the selected REINFORCE update."""
 
-    returns, advantages = returns_and_advantages(episode["rewards"], gamma, normalize_returns)
-    print(f"{'t':>3}  {'state':>8}  {'action':>6}  {'reward':>8}  {'return':>8}  {'adv':>8}  effect")
+    update_mode = resolve_update_mode(update_mode)
+    returns, advantages = returns_and_advantages(
+        episode["rewards"],
+        gamma,
+        normalize_returns=normalize_returns,
+        update_mode=update_mode,
+    )
+    print(f"update mode: {update_mode}")
+    print(
+        f"{'t':>3}  {'state':>8}  {'action':>6}  "
+        f"{'reward':>8}  {'return':>8}  {'signal':>8}  effect"
+    )
     print("-" * 67)
     for t, (state, action, reward, ret, adv) in enumerate(
         zip(episode["states"], episode["actions"], episode["rewards"], returns, advantages)

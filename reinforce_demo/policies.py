@@ -30,7 +30,17 @@ POLICY_MODE_ALIASES = {
     "3": "large_mlp",
 }
 
+UPDATE_MODES = {
+    "vanilla": "Raw discounted returns; no normalization, entropy bonus, or gradient clipping.",
+    "advantage": "Return-as-advantage signal with optional normalization and entropy bonus.",
+}
+UPDATE_MODE_ALIASES = {
+    "1": "vanilla",
+    "2": "advantage",
+}
+
 DEFAULT_POLICY_MODE = "tabular"
+DEFAULT_UPDATE_MODE = "advantage"
 MLP_HIDDEN_SIZE = 32
 LARGE_MLP_HIDDEN_SIZE = 256
 LARGE_MLP_HIDDEN_LAYERS = 4
@@ -142,6 +152,15 @@ def resolve_policy_mode(policy_mode: str) -> str:
     if policy_mode not in POLICY_MODES:
         raise ValueError(f"policy_mode must be one of {sorted(POLICY_MODES)}")
     return policy_mode
+
+
+def resolve_update_mode(update_mode: str) -> str:
+    """Allow numbered shortcuts, then check that the update mode exists."""
+
+    update_mode = UPDATE_MODE_ALIASES.get(str(update_mode), str(update_mode))
+    if update_mode not in UPDATE_MODES:
+        raise ValueError(f"update_mode must be one of {sorted(UPDATE_MODES)}")
+    return update_mode
 
 
 def make_policy(
@@ -258,18 +277,30 @@ def returns_and_advantages(
     rewards: Sequence[float],
     gamma: float,
     normalize_returns: bool = True,
+    update_mode: str = DEFAULT_UPDATE_MODE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute returns and normalized advantages.
+    """Compute returns and the learning signal used by the policy update.
 
-    In this simple notebook we use the return itself as the advantage, then
-    optionally normalize it so updates are less sensitive to scale.
+    `vanilla` mode uses the raw discounted returns. `advantage` mode uses the
+    return itself as an advantage-style signal, then optionally normalizes it so
+    updates are less sensitive to scale.
     """
 
+    update_mode = resolve_update_mode(update_mode)
     returns = discounted_returns(rewards, gamma)
     advantages = returns.clone()
-    if normalize_returns and len(advantages) > 1:
+    if update_mode == "advantage" and normalize_returns and len(advantages) > 1:
         advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
     return returns, advantages
+
+
+def _gradient_norm(parameters) -> torch.Tensor:
+    """Measure the current gradient norm without changing gradients."""
+
+    norms = [parameter.grad.detach().norm(2) for parameter in parameters if parameter.grad is not None]
+    if not norms:
+        return torch.tensor(0.0)
+    return torch.norm(torch.stack(norms), p=2)
 
 
 def reinforce_update(
@@ -279,16 +310,28 @@ def reinforce_update(
     gamma: float = 0.98,
     normalize_returns: bool = True,
     entropy_coef: float = 0.01,
-    max_grad_norm: float = 1.0,
+    max_grad_norm: float | None = 1.0,
+    update_mode: str = DEFAULT_UPDATE_MODE,
 ) -> dict[str, float]:
     """Apply one REINFORCE update to the policy.
 
-    The loss is the negative policy-gradient objective:
-    sampled actions with positive advantage are made more likely, and sampled
-    actions with negative advantage are made less likely.
+    `vanilla` mode uses raw discounted returns in the policy-gradient loss.
+    `advantage` mode keeps the existing normalized return-as-advantage signal
+    and optional entropy bonus.
     """
 
-    returns, advantages = returns_and_advantages(episode["rewards"], gamma, normalize_returns)
+    update_mode = resolve_update_mode(update_mode)
+    if update_mode == "vanilla":
+        normalize_returns = False
+        entropy_coef = 0.0
+        max_grad_norm = None
+
+    returns, advantages = returns_and_advantages(
+        episode["rewards"],
+        gamma,
+        normalize_returns=normalize_returns,
+        update_mode=update_mode,
+    )
     log_probs = torch.stack(episode["log_probs"])
     entropies = torch.stack(episode["entropies"])
 
@@ -298,7 +341,10 @@ def reinforce_update(
 
     optimizer.zero_grad()
     loss.backward()
-    grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+    if max_grad_norm is None:
+        grad_norm = _gradient_norm(policy.parameters())
+    else:
+        grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
     optimizer.step()
 
     return {

@@ -15,7 +15,7 @@ from torch import nn
 
 from .environment import GridWorld
 from .plotting import moving_average, plot_policy, policy_action_probs
-from .policies import Episode, collect_episode, reinforce_update, set_seed
+from .policies import DEFAULT_UPDATE_MODE, Episode, collect_episode, reinforce_update, set_seed
 
 
 def train_reinforce(
@@ -32,12 +32,14 @@ def train_reinforce(
     refresh_every: int = 50,
     dashboard_path: str | None = None,
     dashboard_every: int = 10,
+    update_mode: str = DEFAULT_UPDATE_MODE,
 ) -> tuple[dict[str, list[float]], dict[int, np.ndarray]]:
     """Train a policy with REINFORCE and return metrics plus snapshots.
 
     `stats` stores one value per episode for plotting. `snapshots` stores full
     policy probabilities at selected episodes so the notebook can show how the
-    arrows changed over time.
+    arrows changed over time. `update_mode` selects raw vanilla REINFORCE or
+    the stabilized advantage-style update.
     """
 
     set_seed(seed)
@@ -70,6 +72,7 @@ def train_reinforce(
             gamma=gamma,
             normalize_returns=normalize_returns,
             entropy_coef=entropy_coef,
+            update_mode=update_mode,
         )
 
         # 3. Record metrics so we can inspect learning afterward.
