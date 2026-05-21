@@ -22,16 +22,17 @@ ACTIONS: list[State] = [(-1, 0), (0, 1), (1, 0), (0, -1)]
 ACTION_NAMES = ["up", "right", "down", "left"]
 
 REWARD_MODES = {
-    "default": "Dense reward: step cost, small blocked-move penalty, goal bonus.",
+    "dense": "Dense reward: step cost, small blocked-move penalty, goal bonus.",
     "sparse": "Delayed reward: zero until the goal, then a fixed goal bonus.",
     "sparse_length": "Delayed reward: zero until the goal, then goal bonus divided by episode length.",
     "dense_noop_penalty": "Dense reward with a stronger penalty for blocked/no-op moves.",
 }
 REWARD_MODE_ALIASES = {
-    "1": "default",
+    "1": "dense",
     "2": "sparse",
     "3": "sparse_length",
     "4": "dense_noop_penalty",
+    "default": "dense",
 }
 
 
@@ -57,7 +58,7 @@ class GridWorld:
         wall_penalty: float = -0.04,
         noop_penalty: float = -0.12,
         goal_reward: float = 1.0,
-        reward_mode: str = "default",
+        reward_mode: str = "dense",
         max_steps: int | None = None,
     ):
         reward_mode = REWARD_MODE_ALIASES.get(str(reward_mode), str(reward_mode))
@@ -160,7 +161,7 @@ class GridWorld:
     def reward(self, bumped: bool, reached_goal: bool) -> float:
         """Compute the reward for the current step under the chosen mode."""
 
-        if self.reward_mode == "default":
+        if self.reward_mode == "dense":
             reward = self.step_cost + (self.wall_penalty if bumped else 0.0)
             if reached_goal:
                 reward += self.goal_reward
